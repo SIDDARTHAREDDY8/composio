@@ -1171,6 +1171,38 @@ function selectBranchFor(
   return find(resolved, 0) ?? resolved;
 }
 
+/**
+ * Collects every composition branch that describes an object shape: the
+ * schema itself when it declares `properties`, plus every `anyOf`/`oneOf`
+ * branch (through local `$ref`s) that does. Bounded by `MAX_NODE_DEPTH`
+ * and deduplicated, so `$ref` cycles terminate.
+ */
+function objectBranchesFor(
+  schema: unknown,
+  root: Record<string, unknown>
+): Record<string, unknown>[] {
+  const branches: Record<string, unknown>[] = [];
+  const seen = new Set<object>();
+  const visit = (node: unknown, depth: number): void => {
+    const resolved = resolveLocalRefs(node, root);
+    if (!isPlainObject(resolved) || depth > MAX_NODE_DEPTH || seen.has(resolved)) return;
+    seen.add(resolved);
+    if (isPlainObject(resolved.properties)) branches.push(resolved);
+    for (const keyword of ['anyOf', 'oneOf']) {
+      const branchesOfKeyword = resolved[keyword];
+      if (!Array.isArray(branchesOfKeyword)) continue;
+      for (const branch of branchesOfKeyword) visit(branch, depth + 1);
+    }
+  };
+  visit(schema, 0);
+  return branches;
+}
+
+/** Properties declared by a branch, or `{}` when it declares none. */
+function propertiesOf(branch: Record<string, unknown>): Record<string, unknown> {
+  return isPlainObject(branch.properties) ? branch.properties : {};
+}
+
 function omitNulls(
   value: unknown,
   schema: unknown,
@@ -1188,14 +1220,26 @@ function omitNulls(
   }
   if (!isPlainObject(value)) return value;
 
-  const properties = node && isPlainObject(node.properties) ? node.properties : {};
+  // A key may be declared only by a later `anyOf`/`oneOf` branch, so look it
+  // up across every object branch: a null is kept only when no branch
+  // declares the key, or when some declaring branch accepts null. A
+  // non-null child recurses with the first branch that declares the key.
+  const branches = objectBranchesFor(schema, root);
   const clone: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    const propertySchema = Object.prototype.hasOwnProperty.call(properties, key)
-      ? properties[key]
-      : undefined;
+    const declaring = branches.find(branch =>
+      Object.prototype.hasOwnProperty.call(propertiesOf(branch), key)
+    );
+    const propertySchema = declaring === undefined ? undefined : propertiesOf(declaring)[key];
     if (child === null) {
-      if (propertySchema === undefined || acceptsNull(propertySchema)) {
+      const keepsNull =
+        propertySchema === undefined ||
+        branches.some(
+          branch =>
+            Object.prototype.hasOwnProperty.call(propertiesOf(branch), key) &&
+            acceptsNull(propertiesOf(branch)[key])
+        );
+      if (keepsNull) {
         setOwn(clone, key, child);
       }
       continue;
